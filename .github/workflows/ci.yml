@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.12.0 is the minimum in package.json engines; the rest track latest.
+        node-version: ['22.12.0', 22, 24, 26]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run test
+
+      # Builds and packs the package, installs the tarball in a fresh project,
+      # type-checks a consumer that imports every export plus every README
+      # snippet (strict nodenext and bundler resolution), then runs it with
+      # both import and require.
+      - run: npm run check:consumer
+
+  # Publishes to the public npm registry when package.json has a version that
+  # isn't published yet, then tags that commit. Authentication uses npm trusted
+  # publishing (OIDC), so no npm token is stored in GitHub; see "Releasing" in
+  # README.md for the one-time setup.
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write # push the version tag
+      id-token: write # npm trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install --global npm@^11.5.1
+
+      - name: Check whether this version is published
+        id: published
+        run: |
+          spec="$(node -p 'const p = require("./package.json"); `${p.name}@${p.version}`')"
+          if out=$(npm view "$spec" version 2>&1) && [ -n "$out" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$spec is already published; nothing to release."
+          elif grep -q E404 <<<"$out"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "npm view $spec failed:"; echo "$out"; exit 1
+          fi
+
+      - if: steps.published.outputs.exists == 'false'
+        run: npm ci
+
+      # prepublishOnly builds dist/; provenance comes from publishConfig.
+      - if: steps.published.outputs.exists == 'false'
+        run: npm publish
+
+      - if: steps.published.outputs.exists == 'false'
+        name: Tag the release
+        run: |
+          tag="v$(node -p 'require("./package.json").version')"
+          git tag "$tag"
+          git push origin "$tag"
